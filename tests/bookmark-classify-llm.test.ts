@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { attachStderrToError, buildEngineArgs, readClassificationLock, withClassificationLock } from '../src/bookmark-classify-llm.js';
+import { attachStderrToError, buildEngineArgs, configuredCodexModel, readClassificationLock, withClassificationLock } from '../src/bookmark-classify-llm.js';
 
-test('buildEngineArgs adds skip-git-repo-check for codex', () => {
+test('buildEngineArgs denies tools and bounds acpx execution', () => {
   assert.deepEqual(
     buildEngineArgs('codex', 'Return ONLY []'),
-    ['exec', '--skip-git-repo-check', '--model', 'gpt-5.4-mini', '--config', 'model_reasoning_effort="low"', 'Return ONLY []'],
+    ['--deny-all', '--format', 'quiet', '--timeout', '110', 'codex', 'exec'],
   );
 });
 
@@ -23,10 +23,7 @@ test('buildEngineArgs respects FT_CODEX_MODEL override', () => {
   process.env.FT_CODEX_MODEL = 'gpt-5.4';
 
   try {
-    assert.deepEqual(
-      buildEngineArgs('codex', 'Return ONLY []'),
-      ['exec', '--skip-git-repo-check', '--model', 'gpt-5.4', '--config', 'model_reasoning_effort="low"', 'Return ONLY []'],
-    );
+    assert.equal(configuredCodexModel(), 'gpt-5.4');
   } finally {
     delete process.env.FT_CODEX_MODEL;
   }
