@@ -1,5 +1,11 @@
 # Field Theory CLI
 
+Local bookmark classification uses the configured upstream engine. Category and
+domain jobs report batch progress and hold `classification-lock.json` in the
+bookmark data directory to reject overlapping jobs. `ft status` shows an active
+classification job. Codex classification uses its saved CLI login and reads the
+final response file rather than session output.
+
 Sync and store bookmarks locally, manage Field Theory Library and command workflows, and make local context available to Claude Code, Codex, or any agent with shell access.
 
 Free and open source. Designed for Mac.

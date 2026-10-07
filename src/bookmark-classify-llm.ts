@@ -9,7 +9,35 @@
 import { openDb, saveDb } from './db.js';
 import { twitterBookmarksIndexPath } from './paths.js';
 import type { ResolvedEngine } from './engine.js';
-import { invokeEngine } from './engine.js';
+import { invokeEngineAsync } from './engine.js';
+import { withClassificationLock } from './classification-lock.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+export async function invokeClassifier(engine: ResolvedEngine, prompt: string): Promise<string> {
+  if (engine.name !== 'codex') return invokeEngineAsync(engine, prompt);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-codex-'));
+  const output = path.join(dir, 'last-message.txt');
+  const configured: ResolvedEngine = {
+    ...engine,
+    config: {
+      ...engine.config,
+      args: (text, profile) => {
+        const args = engine.config.args(text, profile);
+        return [...args.slice(0, -1), '--output-last-message', output, args[args.length - 1]];
+      },
+    },
+  };
+  try {
+    await invokeEngineAsync(configured, prompt, {
+      env: { HOME: process.env.HOME, PATH: process.env.PATH, TERM: process.env.TERM ?? 'xterm-256color' },
+    });
+    return fs.readFileSync(output, 'utf8').trim();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 const BATCH_SIZE = 50;
 
@@ -169,7 +197,11 @@ export interface LlmClassifyResult {
   batches: number;
 }
 
-export async function classifyWithLlm(
+export function classifyWithLlm(options: Parameters<typeof classifyCategories>[0]): Promise<LlmClassifyResult> {
+  return withClassificationLock('classify', () => classifyCategories(options));
+}
+
+async function classifyCategories(
   options: { engine: ResolvedEngine; onBatch?: (done: number, total: number) => void },
 ): Promise<LlmClassifyResult> {
   const { engine } = options;
@@ -211,7 +243,7 @@ export async function classifyWithLlm(
 
       try {
         const prompt = buildPrompt(batch);
-        const raw = invokeEngine(engine, prompt);
+        const raw = await invokeClassifier(engine, prompt);
         const results = parseResponse(raw, batchIds);
 
         // Update SQLite
@@ -232,6 +264,7 @@ export async function classifyWithLlm(
         failed += batch.length;
         process.stderr.write(`  Batch ${batchCount} failed: ${(err as Error).message}\n`);
       }
+      options.onBatch?.(Math.min(i + BATCH_SIZE, totalUnclassified), totalUnclassified);
     }
 
     return { engine: engine.name, totalUnclassified, classified, failed, batches: batchCount };
@@ -282,7 +315,11 @@ Bookmarks:
 ${items}`;
 }
 
-export async function classifyDomainsWithLlm(
+export function classifyDomainsWithLlm(options: Parameters<typeof classifyDomains>[0]): Promise<LlmClassifyResult> {
+  return withClassificationLock('classify-domains', () => classifyDomains(options));
+}
+
+async function classifyDomains(
   options: { engine: ResolvedEngine; all?: boolean; onBatch?: (done: number, total: number) => void },
 ): Promise<LlmClassifyResult> {
   const { engine } = options;
@@ -328,7 +365,7 @@ export async function classifyDomainsWithLlm(
 
       try {
         const prompt = buildDomainPrompt(batch);
-        const raw = invokeEngine(engine, prompt);
+        const raw = await invokeClassifier(engine, prompt);
         // Reuse the same parse logic — structure is identical
         const results = parseResponse(raw, batchIds);
 
@@ -347,6 +384,7 @@ export async function classifyDomainsWithLlm(
         failed += batch.length;
         process.stderr.write(`  Batch ${batchCount} failed: ${(err as Error).message}\n`);
       }
+      options.onBatch?.(Math.min(i + BATCH_SIZE, total), total);
     }
 
     return { engine: engine.name, totalUnclassified: total, classified, failed, batches: batchCount };

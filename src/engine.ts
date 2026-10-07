@@ -233,6 +233,7 @@ export async function resolveEngine(profile: EngineRunProfile = {}): Promise<Res
 // ── Invocation ─────────────────────────────────────────────────────────
 
 export interface InvokeOptions {
+  env?: NodeJS.ProcessEnv;
   timeout?: number;
   maxBuffer?: number;
 }
@@ -431,6 +432,7 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args(prompt, engine), {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: opts.env,
     });
 
     // Close stdin immediately with EOF so `claude -p` doesn't wait on it.
