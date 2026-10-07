@@ -7,10 +7,19 @@
  */
 
 import * as childProcess from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { openDb, saveDb } from './db.js';
-import { twitterBookmarksIndexPath } from './paths.js';
+import { classificationLockPath, twitterBookmarksIndexPath } from './paths.js';
 
-const BATCH_SIZE = 50;
+export const CLASSIFICATION_BATCH_SIZE = 50;
+
+export interface ClassificationLock {
+  pid: number;
+  kind: 'classify' | 'classify-domains';
+  startedAt: string;
+}
 
 interface UnclassifiedBookmark {
   id: string;
@@ -27,24 +36,104 @@ interface LlmClassification {
 
 // ── Engine detection ────────────────────────────────────────────────────
 
-type Engine = 'claude' | 'codex';
+export type Engine = 'claude' | 'codex';
+export const DEFAULT_CODEX_MODEL = 'gpt-5.4-mini';
+const CMUX_CLAUDE_WRAPPER_MARKER = 'cmux claude wrapper - injects hooks and session tracking';
 
-function detectEngine(): Engine | null {
+function isExecutableFile(filePath: string): boolean {
   try {
-    childProcess.execFileSync('which', ['claude'], { stdio: 'ignore' });
-    return 'claude';
-  } catch { /* not found */ }
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sameFile(a: string, b: string): boolean {
   try {
-    childProcess.execFileSync('which', ['codex'], { stdio: 'ignore' });
-    return 'codex';
-  } catch { /* not found */ }
+    return fs.realpathSync(a) === fs.realpathSync(b);
+  } catch {
+    return path.resolve(a) === path.resolve(b);
+  }
+}
+
+function resolveCommandPath(command: string, searchPath = process.env.PATH ?? ''): string | null {
+  for (const dir of searchPath.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, command);
+    if (isExecutableFile(candidate)) {
+      return candidate;
+    }
+  }
   return null;
+}
+
+function isCmuxClaudeWrapper(filePath: string): boolean {
+  try {
+    return fs.readFileSync(filePath, 'utf8').includes(CMUX_CLAUDE_WRAPPER_MARKER);
+  } catch {
+    return false;
+  }
+}
+
+function resolveClaudeExecutable(searchPath = process.env.PATH ?? ''): string | null {
+  const wrapperPath = resolveCommandPath('claude', searchPath);
+  if (!wrapperPath) return null;
+  if (!isCmuxClaudeWrapper(wrapperPath)) return wrapperPath;
+
+  const customPath = process.env.CMUX_CUSTOM_CLAUDE_PATH?.trim();
+  if (customPath && isExecutableFile(customPath) && !sameFile(customPath, wrapperPath)) {
+    return customPath;
+  }
+
+  const wrapperDir = path.dirname(wrapperPath);
+  let skippedWrapperDir = false;
+  for (const dir of searchPath.split(path.delimiter)) {
+    if (!dir) continue;
+    if (!skippedWrapperDir) {
+      if (path.resolve(dir) === path.resolve(wrapperDir)) {
+        skippedWrapperDir = true;
+      }
+      continue;
+    }
+
+    const candidate = path.join(dir, 'claude');
+    if (isExecutableFile(candidate) && !sameFile(candidate, wrapperPath)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+export function detectEngine(searchPath = process.env.PATH ?? ''): Engine | null {
+  if (hasEngine('claude', searchPath)) return 'claude';
+  if (hasEngine('codex', searchPath)) return 'codex';
+  return null;
+}
+
+export function hasEngine(engine: Engine, searchPath = process.env.PATH ?? ''): boolean {
+  return engine === 'claude'
+    ? resolveClaudeExecutable(searchPath) !== null
+    : resolveCommandPath(engine, searchPath) !== null;
+}
+
+export function configuredCodexModel(): string {
+  return process.env.FT_CODEX_MODEL || DEFAULT_CODEX_MODEL;
 }
 
 export function buildEngineArgs(engine: Engine, prompt: string): string[] {
   return engine === 'claude'
     ? ['-p', '--output-format', 'text', prompt]
-    : ['exec', '--skip-git-repo-check', prompt];
+    : [
+      'exec',
+      '--skip-git-repo-check',
+      '--model',
+      configuredCodexModel(),
+      '--config',
+      'model_reasoning_effort="low"',
+      prompt,
+    ];
 }
 
 export function attachStderrToError(error: unknown): Error {
@@ -64,19 +153,103 @@ export function attachStderrToError(error: unknown): Error {
   return error;
 }
 
-function invokeEngine(engine: Engine, prompt: string): string {
-  const bin = engine === 'claude' ? 'claude' : 'codex';
-  const args = buildEngineArgs(engine, prompt);
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function readClassificationLock(): ClassificationLock | null {
+  const lockPath = classificationLockPath();
+  if (!fs.existsSync(lockPath)) return null;
 
   try {
-    return childProcess.execFileSync(bin, args, {
+    const raw = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as Partial<ClassificationLock>;
+    if (
+      typeof raw.pid !== 'number' ||
+      (raw.kind !== 'classify' && raw.kind !== 'classify-domains') ||
+      typeof raw.startedAt !== 'string'
+    ) {
+      fs.rmSync(lockPath, { force: true });
+      return null;
+    }
+
+    if (!isProcessAlive(raw.pid)) {
+      fs.rmSync(lockPath, { force: true });
+      return null;
+    }
+
+    return {
+      pid: raw.pid,
+      kind: raw.kind,
+      startedAt: raw.startedAt,
+    };
+  } catch {
+    fs.rmSync(lockPath, { force: true });
+    return null;
+  }
+}
+
+export function withClassificationLock<T>(
+  kind: 'classify' | 'classify-domains',
+  fn: () => Promise<T>,
+): Promise<T> {
+  const existing = readClassificationLock();
+  if (existing) {
+    throw new Error(`Classification already running (${existing.kind}, pid ${existing.pid})`);
+  }
+
+  const lockPath = classificationLockPath();
+  const lock: ClassificationLock = {
+    pid: process.pid,
+    kind,
+    startedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, { encoding: 'utf8', flag: 'w' });
+
+  return fn().finally(() => {
+    const current = readClassificationLock();
+    if (current?.pid === process.pid && current.kind === kind) {
+      fs.rmSync(lockPath, { force: true });
+    }
+  });
+}
+
+function invokeEngine(engine: Engine, prompt: string): string {
+  const bin = engine === 'claude' ? 'claude' : 'codex';
+  const tempOutputPath = engine === 'codex'
+    ? path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ft-codex-')), 'last-message.txt')
+    : null;
+  const args = engine === 'codex' && tempOutputPath
+    ? [...buildEngineArgs(engine, prompt).slice(0, -1), '--output-last-message', tempOutputPath, prompt]
+    : buildEngineArgs(engine, prompt);
+
+  try {
+    const stdout = childProcess.execFileSync(bin, args, {
       encoding: 'utf-8',
       timeout: 120_000, // 2 minutes per batch
       maxBuffer: 1024 * 1024,
       stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
+      env: engine === 'codex'
+        ? { HOME: process.env.HOME, PATH: process.env.PATH, TERM: process.env.TERM ?? 'xterm-256color' }
+        : process.env,
+    });
+
+    if (engine === 'codex' && tempOutputPath) {
+      return fs.readFileSync(tempOutputPath, 'utf8').trim();
+    }
+
+    return stdout.trim();
   } catch (error) {
     throw attachStderrToError(error);
+  } finally {
+    if (tempOutputPath) {
+      fs.rmSync(path.dirname(tempOutputPath), { recursive: true, force: true });
+    }
   }
 }
 
@@ -204,8 +377,8 @@ export async function classifyWithLlm(
     let batchCount = 0;
 
     // Process in batches
-    for (let i = 0; i < unclassified.length; i += BATCH_SIZE) {
-      const batch = unclassified.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < unclassified.length; i += CLASSIFICATION_BATCH_SIZE) {
+      const batch = unclassified.slice(i, i + CLASSIFICATION_BATCH_SIZE);
       const batchIds = new Set(batch.map(b => b.id));
       batchCount++;
 
@@ -329,8 +502,8 @@ export async function classifyDomainsWithLlm(
     let failed = 0;
     let batchCount = 0;
 
-    for (let i = 0; i < bookmarks.length; i += BATCH_SIZE) {
-      const batch = bookmarks.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < bookmarks.length; i += CLASSIFICATION_BATCH_SIZE) {
+      const batch = bookmarks.slice(i, i + CLASSIFICATION_BATCH_SIZE);
       const batchIds = new Set(batch.map(b => b.id));
       batchCount++;
 
