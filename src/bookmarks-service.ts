@@ -1,5 +1,6 @@
 import { getTwitterBookmarksStatus } from './bookmarks.js';
-import { buildIndex } from './bookmarks-db.js';
+import { buildIndex, getClassificationProgress } from './bookmarks-db.js';
+import { CLASSIFICATION_BATCH_SIZE, configuredCodexModel, detectEngine, hasEngine, readClassificationLock } from './bookmark-classify-llm.js';
 import { loadTwitterOAuthToken } from './xauth.js';
 import { syncBookmarksGraphQL, type SyncProgress } from './graphql-bookmarks.js';
 
@@ -14,6 +15,12 @@ export interface BookmarkEnableResult {
 export interface BookmarkStatusView {
   connected: boolean;
   bookmarkCount: number;
+  categoriesDone: number;
+  domainsDone: number;
+  classificationEngine: 'claude' | 'codex' | 'none';
+  classifierAccess: { claude: boolean; codex: boolean };
+  codexModel: string;
+  classificationJob: { pid: number; kind: 'classify' | 'classify-domains'; batchSize: number } | null;
   lastUpdated: string | null;
   mode: string;
   cachePath: string;
@@ -49,9 +56,27 @@ export async function enableBookmarks(): Promise<BookmarkEnableResult> {
 export async function getBookmarkStatusView(): Promise<BookmarkStatusView> {
   const token = await loadTwitterOAuthToken();
   const status = await getTwitterBookmarksStatus();
+  const progress = await getClassificationProgress();
   return {
     connected: Boolean(token?.access_token),
     bookmarkCount: status.totalBookmarks,
+    categoriesDone: progress.categoriesDone,
+    domainsDone: progress.domainsDone,
+    classificationEngine: detectEngine() ?? 'none',
+    classifierAccess: {
+      claude: hasEngine('claude'),
+      codex: hasEngine('codex'),
+    },
+    codexModel: configuredCodexModel(),
+    classificationJob: (() => {
+      const lock = readClassificationLock();
+      if (!lock) return null;
+      return {
+        pid: lock.pid,
+        kind: lock.kind,
+        batchSize: CLASSIFICATION_BATCH_SIZE,
+      };
+    })(),
     lastUpdated: status.lastIncrementalSyncAt ?? status.lastFullSyncAt ?? null,
     mode: token?.access_token ? 'Incremental by default (GraphQL + API available)' : 'Incremental by default (GraphQL)',
     cachePath: status.cachePath,
@@ -62,6 +87,13 @@ export function formatBookmarkStatus(view: BookmarkStatusView): string {
   return [
     'Bookmarks',
     `  bookmarks: ${view.bookmarkCount}`,
+    `  categories: ${view.categoriesDone}/${view.bookmarkCount}`,
+    `  domains: ${view.domainsDone}/${view.bookmarkCount}`,
+    `  classifier: ${view.classificationEngine}${view.classificationEngine === 'codex' ? ` (${view.codexModel})` : ''}`,
+    `  agent access: claude=${view.classifierAccess.claude ? 'yes' : 'no'}, codex=${view.classifierAccess.codex ? 'yes' : 'no'}`,
+    ...(view.classificationJob
+      ? [`  classification: running (${view.classificationJob.kind}, pid ${view.classificationJob.pid}, ${view.classificationJob.batchSize}/batch)`]
+      : []),
     `  last updated: ${view.lastUpdated ?? 'never'}`,
     `  sync mode: ${view.mode}`,
     `  cache: ${view.cachePath}`,
@@ -69,5 +101,8 @@ export function formatBookmarkStatus(view: BookmarkStatusView): string {
 }
 
 export function formatBookmarkSummary(view: BookmarkStatusView): string {
-  return `bookmarks=${view.bookmarkCount} updated=${view.lastUpdated ?? 'never'} mode="${view.mode}"`;
+  const classification = view.classificationJob
+    ? ` classification=${view.classificationJob.kind}:${view.classificationJob.pid}:${view.classificationJob.batchSize}`
+    : '';
+  return `bookmarks=${view.bookmarkCount} categories=${view.categoriesDone}/${view.bookmarkCount} domains=${view.domainsDone}/${view.bookmarkCount} classifier=${view.classificationEngine}${view.classificationEngine === 'codex' ? `:${view.codexModel}` : ''} access=claude:${view.classifierAccess.claude ? 'yes' : 'no'},codex:${view.classifierAccess.codex ? 'yes' : 'no'}${classification} updated=${view.lastUpdated ?? 'never'} mode="${view.mode}"`;
 }

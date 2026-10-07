@@ -48,6 +48,10 @@ export function twitterBookmarksIndexPath(): string {
   return path.join(dataDir(), 'bookmarks.db');
 }
 
+export function classificationLockPath(): string {
+  return path.join(dataDir(), 'classification-lock.json');
+}
+
 export function isFirstRun(): boolean {
   return !fs.existsSync(twitterBookmarksCachePath());
 }
