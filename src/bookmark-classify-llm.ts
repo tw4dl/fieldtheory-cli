@@ -1,17 +1,18 @@
 /**
- * LLM-based bookmark classification — uses `claude -p` or `codex exec`
+ * LLM-based bookmark classification — uses `claude -p` or `acpx codex exec`
  * (whichever the user has via their Max/Pro subscription) to classify
  * bookmarks that the regex classifier couldn't categorize.
  *
  * No API keys needed. No local models. Just a logged-in Claude or Codex CLI.
  */
 
-import * as childProcess from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { openDb, saveDb } from './db.js';
 import { classificationLockPath, twitterBookmarksIndexPath } from './paths.js';
+import { codexEnvironment, hasIsolatedCodexLogin } from './classifier-auth.js';
+import { runClassifierWorker } from './classifier-worker.js';
 
 export const CLASSIFICATION_BATCH_SIZE = 50;
 
@@ -37,7 +38,7 @@ interface LlmClassification {
 // ── Engine detection ────────────────────────────────────────────────────
 
 export type Engine = 'claude' | 'codex';
-export const DEFAULT_CODEX_MODEL = 'gpt-5.4-mini';
+export const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const CMUX_CLAUDE_WRAPPER_MARKER = 'cmux claude wrapper - injects hooks and session tracking';
 
 function isExecutableFile(filePath: string): boolean {
@@ -107,6 +108,7 @@ function resolveClaudeExecutable(searchPath = process.env.PATH ?? ''): string | 
 }
 
 export function detectEngine(searchPath = process.env.PATH ?? ''): Engine | null {
+  if (hasIsolatedCodexLogin() && hasEngine('codex', searchPath)) return 'codex';
   if (hasEngine('claude', searchPath)) return 'claude';
   if (hasEngine('codex', searchPath)) return 'codex';
   return null;
@@ -115,7 +117,7 @@ export function detectEngine(searchPath = process.env.PATH ?? ''): Engine | null
 export function hasEngine(engine: Engine, searchPath = process.env.PATH ?? ''): boolean {
   return engine === 'claude'
     ? resolveClaudeExecutable(searchPath) !== null
-    : resolveCommandPath(engine, searchPath) !== null;
+    : resolveCommandPath('acpx', searchPath) !== null;
 }
 
 export function configuredCodexModel(): string {
@@ -126,13 +128,7 @@ export function buildEngineArgs(engine: Engine, prompt: string): string[] {
   return engine === 'claude'
     ? ['-p', '--output-format', 'text', prompt]
     : [
-      'exec',
-      '--skip-git-repo-check',
-      '--model',
-      configuredCodexModel(),
-      '--config',
-      'model_reasoning_effort="low"',
-      prompt,
+      '--deny-all', '--format', 'quiet', '--timeout', '110', 'codex', 'exec',
     ];
 }
 
@@ -219,36 +215,37 @@ export function withClassificationLock<T>(
   });
 }
 
-function invokeEngine(engine: Engine, prompt: string): string {
-  const bin = engine === 'claude' ? 'claude' : 'codex';
-  const tempOutputPath = engine === 'codex'
-    ? path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ft-codex-')), 'last-message.txt')
+export async function invokeEngine(engine: Engine, prompt: string): Promise<string> {
+  const env = engine === 'codex' ? codexEnvironment() : process.env;
+  const bin = engine === 'claude' ? resolveClaudeExecutable() : resolveCommandPath('acpx');
+  if (!bin) throw new Error(`Missing classifier executable: ${engine === 'codex' ? 'acpx' : 'claude'}`);
+  const workspace = engine === 'codex'
+    ? fs.mkdtempSync(path.join(os.tmpdir(), 'ft-codex-'))
     : null;
-  const args = engine === 'codex' && tempOutputPath
-    ? [...buildEngineArgs(engine, prompt).slice(0, -1), '--output-last-message', tempOutputPath, prompt]
+  const args = workspace
+    ? ['--cwd', workspace, ...buildEngineArgs(engine, prompt)]
     : buildEngineArgs(engine, prompt);
 
   try {
-    const stdout = childProcess.execFileSync(bin, args, {
-      encoding: 'utf-8',
-      timeout: 120_000, // 2 minutes per batch
-      maxBuffer: 1024 * 1024,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: engine === 'codex'
-        ? { HOME: process.env.HOME, PATH: process.env.PATH, TERM: process.env.TERM ?? 'xterm-256color' }
-        : process.env,
-    });
-
-    if (engine === 'codex' && tempOutputPath) {
-      return fs.readFileSync(tempOutputPath, 'utf8').trim();
+    if (workspace) {
+      const model = configuredCodexModel();
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(model)) throw new Error('Invalid FT_CODEX_MODEL');
+      fs.writeFileSync(path.join(workspace, '.acpxrc.json'), JSON.stringify({
+        agents: { codex: { command: `npx --yes @zed-industries/codex-acp -c 'model="${model}"' -c 'forced_login_method="chatgpt"'` } },
+      }), { mode: 0o600 });
     }
+    const stdout = await runClassifierWorker(bin, args, {
+      env,
+      cwd: workspace ?? undefined,
+      input: workspace ? `${prompt}\nDo not use tools, read files, or run commands.` : undefined,
+    });
 
     return stdout.trim();
   } catch (error) {
     throw attachStderrToError(error);
   } finally {
-    if (tempOutputPath) {
-      fs.rmSync(path.dirname(tempOutputPath), { recursive: true, force: true });
+    if (workspace) {
+      fs.rmSync(workspace, { recursive: true, force: true });
     }
   }
 }
@@ -345,9 +342,10 @@ export async function classifyWithLlm(
       'No supported LLM CLI found.\n' +
       'Install one of the following and log in:\n' +
       '  - Claude Code: https://docs.anthropic.com/en/docs/claude-code\n' +
-      '  - Codex CLI:   https://github.com/openai/codex'
+      '  - Codex via acpx: npm install -g acpx (ChatGPT login required)'
     );
   }
+  if (engine === 'codex') codexEnvironment();
 
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
@@ -386,7 +384,7 @@ export async function classifyWithLlm(
 
       try {
         const prompt = buildPrompt(batch);
-        const raw = invokeEngine(engine, prompt);
+        const raw = await invokeEngine(engine, prompt);
         const results = parseResponse(raw, batchIds);
 
         // Update SQLite
@@ -466,9 +464,10 @@ export async function classifyDomainsWithLlm(
       'No supported LLM CLI found.\n' +
       'Install one of the following and log in:\n' +
       '  - Claude Code: https://docs.anthropic.com/en/docs/claude-code\n' +
-      '  - Codex CLI:   https://github.com/openai/codex'
+      '  - Codex via acpx: npm install -g acpx (ChatGPT login required)'
     );
   }
+  if (engine === 'codex') codexEnvironment();
 
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
@@ -511,7 +510,7 @@ export async function classifyDomainsWithLlm(
 
       try {
         const prompt = buildDomainPrompt(batch);
-        const raw = invokeEngine(engine, prompt);
+        const raw = await invokeEngine(engine, prompt);
         // Reuse the same parse logic — structure is identical
         const results = parseResponse(raw, batchIds);
 

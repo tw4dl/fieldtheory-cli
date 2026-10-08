@@ -131,3 +131,26 @@ Use `ft classify` for LLM-powered classification that catches what regex misses.
 ## License
 
 MIT — [fieldtheory.dev/cli](https://fieldtheory.dev/cli)
+# ChatGPT Bookmark Classification
+
+Codex classification uses `acpx` with a ChatGPT login, not paid OpenAI API
+credits. Install `acpx` and save a separate login so your normal Codex credentials
+stay unchanged:
+
+```sh
+npm install -g acpx
+CODEX_HOME="$HOME/.ft-bookmarks/codex" codex login --device-auth
+ft classify
+ft classify-domains
+ft status
+```
+
+The worker defaults to `gpt-5.5`, denies tools, and removes API credentials from
+its environment. Set `FT_CODEX_HOME` for a different ChatGPT credential directory
+or `FT_CODEX_MODEL` for another account-supported model. An isolated login makes
+Codex the preferred classifier. Existing Claude classification remains available.
+The OpenAI Decisions API is a separate API-key service; this path instead follows
+Anchor's ChatGPT-backed Codex decision approach. Use `ft classify` to retry a
+backlog even when a sync finds no new bookmarks.
+Worker process groups are stopped on exit, timeout, or excessive output so ACP
+adapter processes do not remain running after classification ends.
