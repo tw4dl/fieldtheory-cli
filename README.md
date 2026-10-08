@@ -152,3 +152,5 @@ Codex the preferred classifier. Existing Claude classification remains available
 The OpenAI Decisions API is a separate API-key service; this path instead follows
 Anchor's ChatGPT-backed Codex decision approach. Use `ft classify` to retry a
 backlog even when a sync finds no new bookmarks.
+Worker process groups are stopped on exit, timeout, or excessive output so ACP
+adapter processes do not remain running after classification ends.

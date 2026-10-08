@@ -6,13 +6,13 @@
  * No API keys needed. No local models. Just a logged-in Claude or Codex CLI.
  */
 
-import * as childProcess from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { openDb, saveDb } from './db.js';
 import { classificationLockPath, twitterBookmarksIndexPath } from './paths.js';
 import { codexEnvironment, hasIsolatedCodexLogin } from './classifier-auth.js';
+import { runClassifierWorker } from './classifier-worker.js';
 
 export const CLASSIFICATION_BATCH_SIZE = 50;
 
@@ -215,9 +215,10 @@ export function withClassificationLock<T>(
   });
 }
 
-function invokeEngine(engine: Engine, prompt: string): string {
+export async function invokeEngine(engine: Engine, prompt: string): Promise<string> {
   const env = engine === 'codex' ? codexEnvironment() : process.env;
-  const bin = engine === 'claude' ? 'claude' : 'acpx';
+  const bin = engine === 'claude' ? resolveClaudeExecutable() : resolveCommandPath('acpx');
+  if (!bin) throw new Error(`Missing classifier executable: ${engine === 'codex' ? 'acpx' : 'claude'}`);
   const workspace = engine === 'codex'
     ? fs.mkdtempSync(path.join(os.tmpdir(), 'ft-codex-'))
     : null;
@@ -233,11 +234,7 @@ function invokeEngine(engine: Engine, prompt: string): string {
         agents: { codex: { command: `npx --yes @zed-industries/codex-acp -c 'model="${model}"' -c 'forced_login_method="chatgpt"'` } },
       }), { mode: 0o600 });
     }
-    const stdout = childProcess.execFileSync(bin, args, {
-      encoding: 'utf-8',
-      timeout: 120_000, // 2 minutes per batch
-      maxBuffer: 1024 * 1024,
-      stdio: ['pipe', 'pipe', 'pipe'],
+    const stdout = await runClassifierWorker(bin, args, {
       env,
       cwd: workspace ?? undefined,
       input: workspace ? `${prompt}\nDo not use tools, read files, or run commands.` : undefined,
@@ -345,9 +342,10 @@ export async function classifyWithLlm(
       'No supported LLM CLI found.\n' +
       'Install one of the following and log in:\n' +
       '  - Claude Code: https://docs.anthropic.com/en/docs/claude-code\n' +
-      '  - Codex CLI:   https://github.com/openai/codex'
+      '  - Codex via acpx: npm install -g acpx (ChatGPT login required)'
     );
   }
+  if (engine === 'codex') codexEnvironment();
 
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
@@ -386,7 +384,7 @@ export async function classifyWithLlm(
 
       try {
         const prompt = buildPrompt(batch);
-        const raw = invokeEngine(engine, prompt);
+        const raw = await invokeEngine(engine, prompt);
         const results = parseResponse(raw, batchIds);
 
         // Update SQLite
@@ -466,9 +464,10 @@ export async function classifyDomainsWithLlm(
       'No supported LLM CLI found.\n' +
       'Install one of the following and log in:\n' +
       '  - Claude Code: https://docs.anthropic.com/en/docs/claude-code\n' +
-      '  - Codex CLI:   https://github.com/openai/codex'
+      '  - Codex via acpx: npm install -g acpx (ChatGPT login required)'
     );
   }
+  if (engine === 'codex') codexEnvironment();
 
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
@@ -511,7 +510,7 @@ export async function classifyDomainsWithLlm(
 
       try {
         const prompt = buildDomainPrompt(batch);
-        const raw = invokeEngine(engine, prompt);
+        const raw = await invokeEngine(engine, prompt);
         // Reuse the same parse logic — structure is identical
         const results = parseResponse(raw, batchIds);
 
