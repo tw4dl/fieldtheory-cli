@@ -16,7 +16,6 @@ export interface BookmarkEnableResult {
 
 export interface BookmarkStatusView {
   classificationEngine?: string;
-  classifierAccess?: string[];
   classificationJob?: ClassificationLock | null;
   connected: boolean;
   bookmarkCount: number;
@@ -59,11 +58,11 @@ export async function getBookmarkStatusView(): Promise<BookmarkStatusView> {
   const token = await loadTwitterOAuthToken();
   const status = await getTwitterBookmarksStatus();
   const progress = await getClassificationProgress();
+  const availableEngines = detectAvailableEngines();
   return {
     connected: Boolean(token?.access_token),
     bookmarkCount: status.totalBookmarks,
-    classificationEngine: loadPreferences().defaultEngine ?? detectAvailableEngines()[0] ?? 'none',
-    classifierAccess: detectAvailableEngines(),
+    classificationEngine: loadPreferences().defaultEngine ?? availableEngines[0] ?? 'none',
     classificationJob: readClassificationLock(),
     classificationTotal: progress.total,
     categoriesDone: progress.categoriesDone,
@@ -86,7 +85,6 @@ export function formatBookmarkStatus(view: BookmarkStatusView): string {
     `  categories: ${view.categoriesDone}/${total}`,
     `  domains: ${view.domainsDone}/${total}`,
     ...(view.classificationEngine ? [`  classifier: ${view.classificationEngine}`] : []),
-    ...(view.classifierAccess ? [`  agent access: ${view.classifierAccess.join(', ') || 'none'}`] : []),
     ...(view.classificationJob ? [`  classification: running (${view.classificationJob.kind}, pid ${view.classificationJob.pid}, 50/batch)`] : []),
     `  last updated: ${view.lastUpdated ?? 'never'}`,
     `  sync mode: ${view.mode}`,

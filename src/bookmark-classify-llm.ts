@@ -3,41 +3,15 @@
  * (whichever the user has via their Max/Pro subscription) to classify
  * bookmarks that the regex classifier couldn't categorize.
  *
- * No API keys needed. No local models. Just a logged-in Claude or Codex CLI.
+ * Authentication follows the upstream engine and the installed CLI configuration.
  */
 
 import { openDb, saveDb } from './db.js';
 import { twitterBookmarksIndexPath } from './paths.js';
 import type { ResolvedEngine } from './engine.js';
-import { invokeEngineAsync } from './engine.js';
 import { withClassificationLock } from './classification-lock.js';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-
-export async function invokeClassifier(engine: ResolvedEngine, prompt: string): Promise<string> {
-  if (engine.name !== 'codex') return invokeEngineAsync(engine, prompt);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-codex-'));
-  const output = path.join(dir, 'last-message.txt');
-  const configured: ResolvedEngine = {
-    ...engine,
-    config: {
-      ...engine.config,
-      args: (text, profile) => {
-        const args = engine.config.args(text, profile);
-        return [...args.slice(0, -1), '--output-last-message', output, args[args.length - 1]];
-      },
-    },
-  };
-  try {
-    await invokeEngineAsync(configured, prompt, {
-      env: { HOME: process.env.HOME, PATH: process.env.PATH, TERM: process.env.TERM ?? 'xterm-256color' },
-    });
-    return fs.readFileSync(output, 'utf8').trim();
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-}
+import { invokeClassifier } from './codex-classifier.js';
+export { invokeClassifier } from './codex-classifier.js';
 
 const BATCH_SIZE = 50;
 

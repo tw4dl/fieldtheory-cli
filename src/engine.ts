@@ -233,7 +233,6 @@ export async function resolveEngine(profile: EngineRunProfile = {}): Promise<Res
 // ── Invocation ─────────────────────────────────────────────────────────
 
 export interface InvokeOptions {
-  env?: NodeJS.ProcessEnv;
   timeout?: number;
   maxBuffer?: number;
 }
@@ -327,7 +326,8 @@ function buildMessage(
   signal: NodeJS.Signals | null,
   timeoutMs: number,
 ): string {
-  const stderrSnippet = stderr.trim().slice(-500);
+  const explicitError = stderr.match(/^ERROR:.*$/gm)?.at(-1);
+  const stderrSnippet = (explicitError ?? stderr.trim()).slice(-500);
   const detail = stderrSnippet ? ` \u2014 ${stderrSnippet}` : '';
   switch (reason) {
     case 'timeout': {
@@ -432,7 +432,6 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args(prompt, engine), {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: opts.env,
     });
 
     // Close stdin immediately with EOF so `claude -p` doesn't wait on it.
@@ -443,12 +442,17 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
     const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
+    let stderrLine = '';
+    let explicitFailure = '';
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     /** Compute the redacted tail of buffered stderr for error reporting. */
-    const stderrTail = () =>
-      redactSecrets(tailString(Buffer.concat(stderrChunks), STDERR_TAIL_BYTES));
+    const stderrTail = () => {
+      const tail = tailString(Buffer.concat(stderrChunks), STDERR_TAIL_BYTES);
+      const failure = stderrLine.startsWith('ERROR:') ? stderrLine : explicitFailure;
+      return redactSecrets(failure && !tail.includes(failure) ? `${failure}\n${tail}` : tail);
+    };
 
     /** Send SIGTERM, then escalate to SIGKILL after a grace period in case
      *  the child traps SIGTERM. `.unref()` so the escalation timer does not
@@ -491,6 +495,11 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
     });
 
     child.stderr?.on('data', (d: Buffer) => {
+      const lines = (stderrLine + d.toString('utf8')).split('\n');
+      stderrLine = lines.pop()!.slice(0, 1000);
+      for (const line of lines) {
+        if (line.startsWith('ERROR:')) explicitFailure = line.slice(0, 1000);
+      }
       // Bound in-memory stderr by bytes, dropping the oldest chunks first.
       // Keep at least one chunk so a single giant line still shows its tail.
       stderrChunks.push(d);

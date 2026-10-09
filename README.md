@@ -1,10 +1,17 @@
 # Field Theory CLI
 
-Local bookmark classification uses the configured upstream engine. Category and
-domain jobs report batch progress and hold `classification-lock.json` in the
-bookmark data directory to reject overlapping jobs. `ft status` shows an active
-classification job. Codex classification uses its saved CLI login and reads the
-final response file rather than session output.
+Local bookmark classification uses the configured upstream engine. Run Codex
+explicitly with `ft classify --engine codex`. Authentication follows the
+installed CLI's saved login or API-key environment. Field Theory does not set a
+model; it ignores Codex user config and disables plugins and app integrations
+for classification runs. It reads the final response file rather than session
+output.
+
+Category and domain jobs report batch progress and hold
+`classification-lock.json` in the bookmark data directory to reject overlapping
+jobs. `ft status` shows an active job. `ft sync --classify` retries bookmarks
+left unclassified by earlier runs, even when sync adds none. Failed assignments
+return exit code 1.
 
 Sync and store bookmarks locally, manage Field Theory Library and command workflows, and make local context available to Claude Code, Codex, or any agent with shell access.
 
